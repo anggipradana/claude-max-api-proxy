@@ -1,120 +1,131 @@
 # claude-max-api-proxy
 
-> OpenAI-compatible API server that wraps **Claude Code CLI** so you can use your Claude Max subscription with any OpenAI-compatible client (OpenClaw, Cursor, Continue, etc.).
+> OpenAI-compatible API server that wraps **Claude Code CLI** — use your Claude Max subscription with any OpenAI-compatible client (OpenClaw, Cursor, Continue, etc.) **for free**.
 
 Originally forked from [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy) — significantly improved for production use.
 
-## What's New in v2.0
+## How It Works
 
-### Incremental Session Messaging
-Long conversations no longer resend the full history every request. The proxy tracks message counts per session:
-- **First request** → sends full history, creates Claude CLI session (`--session-id`)
-- **Subsequent requests** → sends only **new messages** via `--resume` (fast, no token waste)
+```mermaid
+flowchart TD
+    A([Telegram / Discord / Slack]) -->|message| B[OpenClaw Gateway]
+    B -->|POST /v1/chat/completions\nOpenAI format| C[claude-max-api-proxy\nlocalhost:3456]
 
-```
-[Routes] Session hdr_my-chat... INIT: 3 messages      ← first request
-[Routes] Session hdr_my-chat... INCR: 3→4 (+1)        ← next request, only 1 new message sent
-```
+    C --> D{Session\ntracking}
 
-### Prompt via Stdin (no more E2BIG)
-Previously, large conversations would crash with `Error: spawn E2BIG` (argument list too long). Prompts are now written to the subprocess **stdin**, bypassing OS arg size limits.
+    D -->|New session\nfull history| E[claude CLI\n--session-id UUID\nstdin: full prompt]
+    D -->|Existing session\nnew msgs only| F[claude CLI\n--resume UUID\nstdin: incremental]
 
-### Tool Use Support
-Claude can now execute tools (Bash, file reads, web search, etc.) via:
-```
---allowedTools Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch
---dangerously-skip-permissions
-```
+    E --> G[(Session file\n~/.claude/projects/)]
+    F --> G
 
-### Session Management API
-New endpoints for managing conversation sessions:
-```
-GET    /v1/sessions          → list all active sessions
-DELETE /v1/sessions          → reset all sessions
-DELETE /v1/sessions/:id      → reset a specific session
+    E -->|stream-json| H[Response parser]
+    F -->|stream-json| H
+
+    H -->|OpenAI format\nstreaming or non-streaming| C
+    C -->|response| B
+    B -->|reply| A
+
+    style C fill:#1a1a2e,color:#e0e0e0,stroke:#4a90d9
+    style E fill:#16213e,color:#e0e0e0,stroke:#4a90d9
+    style F fill:#16213e,color:#e0e0e0,stroke:#4a90d9
+    style G fill:#0f3460,color:#e0e0e0,stroke:#4a90d9
 ```
 
-### Smart Session Derivation
-Session IDs are derived automatically (no client setup required):
-1. `X-Session-Id` header (explicit)
-2. `user` field in request body
-3. Hash of the first user message (auto)
+## Architecture
 
-### Extended Timeout
-Default timeout increased from **5 minutes → 15 minutes** for complex agent tasks.
+```mermaid
+flowchart LR
+    subgraph proxy["claude-max-api-proxy (Express)"]
+        R[Routes\n/v1/chat/completions] --> SM[Session Manager\ntrack msg counts]
+        SM -->|INIT: full history| AD1[messagesToPrompt]
+        SM -->|INCR: new msgs only| AD2[extractIncrementalPrompt]
+        AD1 --> SP[Subprocess Manager\nstdin + stream-json parser]
+        AD2 --> SP
+    end
 
-### OpenAI Content Array Support
-Handles both string and array content format (`[{type: "text", text: "..."}]`) from modern OpenAI clients.
+    subgraph cli["Claude Code CLI"]
+        SP -->|--session-id UUID\nnew session| S1[claude --print]
+        SP -->|--resume UUID\nexisting session| S2[claude --print]
+    end
+
+    subgraph api["API Endpoints"]
+        E1["POST /v1/chat/completions"]
+        E2["GET  /v1/models"]
+        E3["GET  /health"]
+        E4["GET  /v1/sessions"]
+        E5["DELETE /v1/sessions"]
+        E6["DELETE /v1/sessions/:id"]
+    end
+
+    api --> R
+
+    style proxy fill:#1a1a2e,color:#e0e0e0,stroke:#4a90d9
+    style cli fill:#16213e,color:#e0e0e0,stroke:#4a90d9
+    style api fill:#0f3460,color:#e0e0e0,stroke:#4a90d9
+```
+
+---
+
+## Features (v2.0)
+
+| Feature | v1.0 (original) | v2.0 (this fork) |
+|---------|-----------------|------------------|
+| Session context | Full history every request | **Incremental** — only new messages |
+| Large contexts | Crash (`E2BIG`) | **Stdin-based** — no size limit |
+| Tool use | ❌ | ✅ Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch |
+| Timeout | 5 minutes | **15 minutes** |
+| Session API | ❌ | ✅ `GET/DELETE /v1/sessions` |
+| Session ID | manual | **Auto-derived** (header → user → hash) |
+| Content format | string only | **string + array** (`[{type,text}]`) |
+| Resume flag | `--session-id` always | ✅ `--session-id` (new) / `--resume` (existing) |
 
 ---
 
 ## Requirements
 
 - Node.js ≥ 20
-- [Claude Code CLI](https://github.com/anthropics/claude-code) installed and authenticated (`claude --version`)
+- [Claude Code CLI](https://github.com/anthropics/claude-code) installed & authenticated
 - Claude Max subscription
 
-## Install
+---
 
-```bash
-npm install -g claude-max-api-proxy
-```
+## Installation
 
-Or clone and run directly:
 ```bash
 git clone https://github.com/anggipradana/claude-max-api-proxy
 cd claude-max-api-proxy
 npm install
-npm start
 ```
 
-## Usage
+---
+
+## Quick Start
+
+### 1. Start the proxy
 
 ```bash
-# Start the proxy (must NOT be run inside a Claude Code session)
-claude-max-api
-
-# Or use the helper script (unsets CLAUDECODE env var automatically)
+# Must NOT be run inside an active Claude Code session (CLAUDECODE env var)
 bash start-proxy.sh
 ```
 
-The server starts at `http://127.0.0.1:3456`.
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (streaming + non-streaming) |
-| `GET`  | `/v1/models` | List available models |
-| `GET`  | `/health` | Health check + session count |
-| `GET`  | `/v1/sessions` | List all active sessions |
-| `DELETE` | `/v1/sessions` | Reset all sessions |
-| `DELETE` | `/v1/sessions/:id` | Reset a specific session |
-
-## Models
-
-| Model ID | Maps to |
-|----------|---------|
-| `claude-sonnet-4` | `claude --model sonnet` |
-| `claude-opus-4` | `claude --model opus` |
-| `claude-haiku-4` | `claude --model haiku` |
-
-## Session Headers
-
+Or with custom port:
 ```bash
-# Pin a conversation to a named session
-curl -H "X-Session-Id: my-chat-123" ...
-
-# Or use the user field
-curl -d '{"user": "my-chat-123", "messages": [...]}' ...
+PORT=3456 bash start-proxy.sh
 ```
 
-## Example
+Verify:
+```bash
+curl http://localhost:3456/health
+# {"status":"ok","provider":"claude-code-cli","sessions":0}
+```
+
+### 2. Test a request
 
 ```bash
 curl -X POST http://localhost:3456/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-Session-Id: test-1" \
+  -H "X-Session-Id: my-chat" \
   -d '{
     "model": "claude-sonnet-4",
     "stream": false,
@@ -122,37 +133,199 @@ curl -X POST http://localhost:3456/v1/chat/completions \
   }'
 ```
 
-## Architecture
-
-```
-Client (OpenClaw/Cursor/etc.)
-    ↓ HTTP (OpenAI format)
-claude-max-api-proxy (Express)
-    ↓ session tracking + prompt formatting
-Claude Code CLI subprocess
-    ├── --print --output-format stream-json
-    ├── --session-id <uuid>   (first request)
-    ├── --resume <uuid>       (subsequent requests)
-    ├── --allowedTools Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch
-    └── --dangerously-skip-permissions
-```
-
-## ⚠ CLAUDECODE env var
-
-If you run the proxy from within a Claude Code session, the `CLAUDECODE` env var will prevent nested CLI spawning. Always start the proxy from a clean shell:
+### 3. (Optional) Configure OpenClaw automatically
 
 ```bash
-unset CLAUDECODE && claude-max-api
+bash setup-openclaw.sh
 ```
 
-Or use the provided `start-proxy.sh` script.
+> See [OpenClaw Setup](#openclaw-setup) below for details.
 
-## Known Limitations
+---
 
-- Claude CLI sessions are file-based (`~/.claude/projects/`). Old sessions accumulate over time — use `DELETE /v1/sessions` to clear them.
-- The `--resume` flag requires the previous session to have completed successfully.
-- Tool execution requires Claude Max subscription with appropriate permissions.
+## OpenClaw Setup
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as setup-openclaw.sh
+    participant P as claude-max-api-proxy
+    participant OC as OpenClaw
+
+    U->>S: bash setup-openclaw.sh
+
+    S->>P: curl /health
+    alt Proxy not running
+        S->>P: start via start-proxy.sh
+    end
+
+    S->>OC: Backup models.json, auth-profiles.json, openclaw.json
+    S->>OC: Write models.json (claude-proxy only)
+    S->>OC: Write auth-profiles.json (claude-proxy:default)
+    S->>OC: Patch openclaw.json (primary + fallback models)
+    S->>OC: kill -SIGUSR1 (reload config)
+
+    OC-->>U: Bot ready on Telegram/Discord
+```
+
+### Manual Setup
+
+If you prefer to configure OpenClaw manually, edit these 3 files:
+
+**`~/.openclaw/agents/main/agent/models.json`**
+```json
+{
+  "providers": {
+    "claude-proxy": {
+      "baseUrl": "http://127.0.0.1:3456/v1",
+      "api": "openai-completions",
+      "apiKey": "dummy",
+      "models": [
+        {
+          "id": "claude-sonnet-4",
+          "name": "Claude Sonnet 4 (via Max Proxy)",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+          "contextWindow": 200000,
+          "maxTokens": 32000
+        },
+        {
+          "id": "claude-haiku-4",
+          "name": "Claude Haiku 4 (via Max Proxy)",
+          "reasoning": false,
+          "input": ["text", "image"],
+          "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+          "contextWindow": 200000,
+          "maxTokens": 32000
+        }
+      ]
+    }
+  }
+}
+```
+
+**`~/.openclaw/agents/main/agent/auth-profiles.json`**
+```json
+{
+  "version": 1,
+  "profiles": {
+    "claude-proxy:default": {
+      "type": "api_key",
+      "provider": "claude-proxy",
+      "key": "dummy"
+    }
+  },
+  "lastGood": { "claude-proxy": "claude-proxy:default" }
+}
+```
+
+**`~/.openclaw/openclaw.json`** (patch `agents.defaults.model`):
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "claude-proxy/claude-sonnet-4",
+        "fallbacks": ["claude-proxy/claude-haiku-4"]
+      },
+      "models": {
+        "claude-proxy/claude-sonnet-4": {},
+        "claude-proxy/claude-haiku-4": {}
+      }
+    }
+  }
+}
+```
+
+Then reload the gateway:
+```bash
+kill -SIGUSR1 $(pgrep -f openclaw-gateway)
+```
+
+---
+
+## API Reference
+
+### `POST /v1/chat/completions`
+
+Standard OpenAI format. Supports streaming (`"stream": true`) and non-streaming.
+
+**Session pinning** (optional):
+```bash
+# Via header (recommended)
+-H "X-Session-Id: my-conversation"
+
+# Via user field
+-d '{"user": "my-conversation", ...}'
+```
+
+If no session ID is provided, one is derived from a hash of the first user message.
+
+### `GET /v1/models`
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "claude-opus-4",   "object": "model"},
+    {"id": "claude-sonnet-4", "object": "model"},
+    {"id": "claude-haiku-4",  "object": "model"}
+  ]
+}
+```
+
+### `GET /v1/sessions`
+
+```json
+{
+  "sessions": [
+    {
+      "externalId": "hdr_my-chat",
+      "claudeSessionId": "550e8400-e29b-41d4-a716-446655440000",
+      "model": "sonnet",
+      "messageCount": 6,
+      "createdAt": "2026-02-25T03:00:00.000Z",
+      "lastUsedAt": "2026-02-25T03:05:00.000Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+### `DELETE /v1/sessions`
+Reset all sessions (next request will re-initialize from full history).
+
+### `DELETE /v1/sessions/:id`
+Reset a specific session by its `externalId`.
+
+---
+
+## Models
+
+| Model ID | Description |
+|----------|-------------|
+| `claude-sonnet-4` | Best balance of speed and capability (default) |
+| `claude-opus-4` | Most powerful, slower |
+| `claude-haiku-4` | Fastest, lighter tasks |
+
+Also accepted: `claude-code-cli/claude-sonnet-4`, `opus`, `sonnet`, `haiku`.
+
+---
+
+## ⚠️ Important Notes
+
+### CLAUDECODE env var
+Claude Code sets `CLAUDECODE` env var while running. The proxy's subprocess will refuse to spawn if this is set. Always start the proxy **outside** of a Claude Code session, or use `start-proxy.sh` which unsets it automatically.
+
+### Session files
+Sessions are stored in `~/.claude/projects/` as `.jsonl` files. They accumulate over time. Use `DELETE /v1/sessions` to clear the proxy's session index, or manually delete old `.jsonl` files.
+
+### Tool use
+The proxy enables full tool use (Bash, file ops, web search) via `--dangerously-skip-permissions`. Only run this proxy in a trusted environment.
+
+---
 
 ## License
 
-MIT
+MIT — forked from [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy)
