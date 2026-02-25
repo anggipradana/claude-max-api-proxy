@@ -171,17 +171,13 @@ export async function handleChatCompletions(req, res) {
             }
         };
 
-        // ── onTimeout: update session state on timeout to prevent message explosion ──
-        // resetSession=true  → first-token timeout: Claude may not have the message → full reset
-        // resetSession=false → inactivity timeout: Claude had the message, just update count
-        const onTimeout = (resetSession = false) => {
+        // ── onTimeout: always update message count to prevent INCR explosion ──
+        // Never reset session — resetting forces a full INIT on next request which
+        // is slow for large contexts and creates an infinite timeout loop.
+        // Keeping the session ID means next request is a fast INCR (just new messages).
+        const onTimeout = () => {
             stats.errorRequests++;
-            if (resetSession) {
-                sessionManager.reset(externalSessionId);
-                console.error(`[Routes] Session ${externalSessionId.slice(0, 16)}... reset after first-token timeout`);
-            } else {
-                sessionManager.updateMessageCount(externalSessionId, totalMessages);
-            }
+            sessionManager.updateMessageCount(externalSessionId, totalMessages);
         };
 
         // ── Run with auto-retry on session-not-found ──
@@ -280,7 +276,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
         timers.firstToken = setTimeout(() => {
             if (isFirst) {
                 console.error(`[Streaming] First-token timeout (${FIRST_TOKEN_TIMEOUT_MS}ms) for request ${requestId}`);
-                onTimeout(true); // reset session — Claude may not have received the message
+                onTimeout();
                 subprocess.kill();
                 sendTimeoutMessage("⏱️ Waktu tunggu habis. Coba kirim ulang pesan.");
                 safeResolve({ sessionError: false });
@@ -291,7 +287,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
         timers.inactivity = setInterval(() => {
             if (!isComplete && !isFirst && (Date.now() - lastActivityAt) > INACTIVITY_TIMEOUT_MS) {
                 console.error(`[Streaming] Inactivity timeout (${INACTIVITY_TIMEOUT_MS}ms) for request ${requestId}`);
-                onTimeout(false); // update count — Claude had the message, just went quiet
+                onTimeout();
                 subprocess.kill();
                 sendTimeoutMessage("⚠️ Tidak ada aktivitas. Coba lagi.");
                 safeResolve({ sessionError: false });
@@ -402,7 +398,7 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
         // ── Overall timeout (first-token + inactivity = 210s by default) ──
         const overallTimer = setTimeout(() => {
             console.error(`[NonStreaming] Overall timeout for request ${requestId}`);
-            onTimeout(true); // reset session — unknown state after timeout
+            onTimeout();
             subprocess.kill();
             if (!res.headersSent) {
                 res.status(503).json({

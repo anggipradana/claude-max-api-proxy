@@ -35,7 +35,7 @@ echo "[2/3] Starting claude-max-api proxy (with auto-restart)..."
 tmux kill-window -t claude-fixed:proxy 2>/dev/null
 tmux new-window -t claude-fixed -n proxy
 tmux send-keys -t claude-fixed:proxy "while true; do
-    env -u CLAUDECODE -u CLAUDE_CODE node /home/anggi/.npm-global/lib/node_modules/claude-max-api-proxy/dist/server/standalone.js 2>&1 | tee /tmp/proxy-new.log
+    env -u CLAUDECODE -u CLAUDE_CODE FIRST_TOKEN_TIMEOUT_MS=300000 node /home/anggi/.npm-global/lib/node_modules/claude-max-api-proxy/dist/server/standalone.js 2>&1 | tee /tmp/proxy-new.log
     echo '[proxy] Crashed or exited. Restarting in 3s...'
     sleep 3
 done" Enter 2>/dev/null
