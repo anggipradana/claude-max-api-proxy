@@ -17,6 +17,13 @@ import {
 import { cliResultToOpenai, createDoneChunk } from "../adapter/cli-to-openai.js";
 import { sessionManager } from "../session/manager.js";
 
+// ─── Session-not-found detection ─────────────────────────────────────────────
+function isSessionNotFoundError(result) {
+    return result?.is_error === true &&
+        Array.isArray(result?.errors) &&
+        result.errors.some(e => typeof e === "string" && e.includes("No conversation found"));
+}
+
 // ─── Concurrency Semaphore ────────────────────────────────────────────────────
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "4");
 
@@ -123,18 +130,33 @@ export async function handleChatCompletions(req, res) {
             }
         };
 
-        // ── Acquire concurrency slot ──
-        await semaphore.acquire();
-        const subprocess = new ClaudeSubprocess();
-
-        try {
-            if (stream) {
-                await handleStreamingResponse(req, res, subprocess, cliInput, requestId, onSuccess);
-            } else {
-                await handleNonStreamingResponse(res, subprocess, cliInput, requestId, onSuccess);
+        // ── Run with auto-retry on session-not-found ──
+        const runAttempt = async (input) => {
+            await semaphore.acquire();
+            const subprocess = new ClaudeSubprocess();
+            try {
+                if (stream) {
+                    return await handleStreamingResponse(req, res, subprocess, input, requestId, onSuccess);
+                } else {
+                    return await handleNonStreamingResponse(res, subprocess, input, requestId, onSuccess);
+                }
+            } finally {
+                semaphore.release();
             }
-        } finally {
-            semaphore.release();
+        };
+
+        let outcome = await runAttempt(cliInput);
+
+        if (outcome?.sessionError) {
+            console.error(`[Routes] Session not found for ${externalSessionId.slice(0, 16)}... — resetting and retrying`);
+            sessionManager.reset(externalSessionId);
+            const { claudeSessionId: newSessionId } = sessionManager.getOrCreate(externalSessionId, model);
+            await runAttempt({
+                ...cliInput,
+                sessionId: newSessionId,
+                isNewSession: true,
+                prompt: messagesToPrompt(body.messages),
+            });
         }
     } catch (error) {
         stats.errorRequests++;
@@ -164,7 +186,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
 
         res.on("close", () => {
             if (!isComplete) subprocess.kill();
-            resolve();
+            resolve({ sessionError: false });
         });
 
         subprocess.on("content_delta", (event) => {
@@ -187,6 +209,12 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
         });
 
         subprocess.on("result", (result) => {
+            // Auto-recovery: if session file deleted and no content sent yet, retry transparently
+            if (isSessionNotFoundError(result) && isFirst) {
+                console.error("[Streaming] Session not found, will retry with new session");
+                resolve({ sessionError: true });
+                return;
+            }
             finalResult = result;
             isComplete = true;
             onSuccess(result);
@@ -195,7 +223,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 res.write("data: [DONE]\n\n");
                 res.end();
             }
-            resolve();
+            resolve({ sessionError: false });
         });
 
         subprocess.on("error", (error) => {
@@ -205,7 +233,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 res.write(`data: ${JSON.stringify({ error: { message: error.message, type: "server_error", code: null } })}\n\n`);
                 res.end();
             }
-            resolve();
+            resolve({ sessionError: false });
         });
 
         subprocess.on("close", (code) => {
@@ -216,7 +244,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 res.write("data: [DONE]\n\n");
                 res.end();
             }
-            resolve();
+            resolve({ sessionError: false });
         });
 
         subprocess.start(cliInput.prompt, {
@@ -231,7 +259,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 res.write(`data: ${JSON.stringify({ error: { message: err.message, type: "server_error", code: null } })}\n\n`);
                 res.end();
             }
-            resolve();
+            resolve({ sessionError: false });
         });
     });
 }
@@ -250,11 +278,17 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
             }
-            resolve();
+            resolve({ sessionError: false });
         });
 
         subprocess.on("close", (code) => {
             if (finalResult) {
+                // Auto-recovery: session file deleted → retry transparently
+                if (isSessionNotFoundError(finalResult)) {
+                    console.error("[NonStreaming] Session not found, will retry with new session");
+                    resolve({ sessionError: true });
+                    return;
+                }
                 onSuccess(finalResult);
                 res.json(cliResultToOpenai(finalResult, requestId));
             } else if (!res.headersSent) {
@@ -263,7 +297,7 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
                     error: { message: `Claude CLI exited with code ${code} without response`, type: "server_error", code: null },
                 });
             }
-            resolve();
+            resolve({ sessionError: false });
         });
 
         subprocess.start(cliInput.prompt, {
@@ -276,7 +310,7 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
             }
-            resolve();
+            resolve({ sessionError: false });
         });
     });
 }
