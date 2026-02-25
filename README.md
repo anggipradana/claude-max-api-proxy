@@ -79,6 +79,11 @@ flowchart LR
 | Session ID | manual | **Auto-derived** (header → user → hash) |
 | Content format | string only | **string + array** (`[{type,text}]`) |
 | Resume flag | `--session-id` always | ✅ `--session-id` (new) / `--resume` (existing) |
+| Model support | basic | ✅ Versioned + family aliases + GPT drop-in aliases |
+| System prompt | inline XML | ✅ Native `--system-prompt` flag |
+| Concurrency | unlimited | ✅ Semaphore (default: 4), 429 when full |
+| Stats endpoint | ❌ | ✅ `GET /stats` (tokens, latency, requests) |
+| Image support | ❌ | ✅ base64 + URL image blocks |
 
 ---
 
@@ -264,14 +269,32 @@ If no session ID is provided, one is derived from a hash of the first user messa
 
 ### `GET /v1/models`
 
+Returns all supported model IDs including versioned, family aliases, and GPT aliases.
+
+### `GET /stats`
+
 ```json
 {
-  "object": "list",
-  "data": [
-    {"id": "claude-opus-4",   "object": "model"},
-    {"id": "claude-sonnet-4", "object": "model"},
-    {"id": "claude-haiku-4",  "object": "model"}
-  ]
+  "uptime": { "ms": 60000, "human": "1m 0s" },
+  "requests": { "total": 10, "completed": 9, "errors": 1, "active": 0, "queued": 0 },
+  "concurrency": { "limit": 4, "active": 0 },
+  "sessions": { "total": 3 },
+  "tokens": { "totalInput": 1500, "totalOutput": 800, "total": 2300 },
+  "performance": { "avgResponseMs": 4200, "sampledRequests": 9 }
+}
+```
+
+### `GET /health`
+
+```json
+{
+  "status": "ok",
+  "provider": "claude-code-cli",
+  "sessions": 3,
+  "activeSubprocesses": 0,
+  "concurrencyLimit": 4,
+  "queuedRequests": 0,
+  "timestamp": "2026-02-25T05:00:00.000Z"
 }
 ```
 
@@ -303,13 +326,36 @@ Reset a specific session by its `externalId`.
 
 ## Models
 
+### Versioned IDs (recommended for production)
+
 | Model ID | Description |
 |----------|-------------|
-| `claude-sonnet-4` | Best balance of speed and capability (default) |
-| `claude-opus-4` | Most powerful, slower |
-| `claude-haiku-4` | Fastest, lighter tasks |
+| `claude-sonnet-4-6` | Claude Sonnet 4.6 — latest sonnet |
+| `claude-sonnet-4-5` | Claude Sonnet 4.5 |
+| `claude-haiku-4-5` | Claude Haiku 4.5 — latest haiku |
+| `claude-opus-4-5` | Claude Opus 4.5 |
 
-Also accepted: `claude-code-cli/claude-sonnet-4`, `opus`, `sonnet`, `haiku`.
+### Family aliases (always latest in family)
+
+| Model ID | Description |
+|----------|-------------|
+| `claude-sonnet-4` | Latest Sonnet (default) |
+| `claude-opus-4` | Latest Opus |
+| `claude-haiku-4` | Latest Haiku |
+| `sonnet` / `opus` / `haiku` | Short aliases |
+
+### GPT drop-in aliases
+
+| OpenAI Model | Maps to |
+|--------------|---------|
+| `gpt-4o` | `sonnet` |
+| `gpt-4o-mini` | `haiku` |
+| `gpt-4` / `gpt-4-turbo` | `opus` |
+| `gpt-3.5-turbo` | `haiku` |
+| `o1` / `o1-preview` | `opus` |
+| `o1-mini` / `o3-mini` | `sonnet` |
+
+Also accepted: `claude-code-cli/claude-sonnet-4` prefixed variants.
 
 ---
 

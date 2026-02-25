@@ -2,13 +2,22 @@
  * Claude Code CLI Subprocess Manager - Enhanced
  *
  * Handles spawning, managing, and parsing output from Claude CLI subprocesses.
+ * Features:
+ *  - Prompt via stdin (no E2BIG crash for large contexts)
+ *  - --system-prompt flag support
+ *  - Concurrency tracking
+ *  - 15-minute timeout
  */
 import { spawn } from "child_process";
 import { EventEmitter } from "events";
 import { isAssistantMessage, isResultMessage, isContentDelta } from "../types/claude-cli.js";
 
-// 15 minutes - enough for complex multi-step agent tasks
+// 15 minutes — enough for complex multi-step agent tasks
 const DEFAULT_TIMEOUT = 15 * 60 * 1000;
+
+// ─── Active subprocess counter (for /stats) ───────────────────────────────────
+let _activeCount = 0;
+export function getActiveSubprocessCount() { return _activeCount; }
 
 export class ClaudeSubprocess extends EventEmitter {
     process = null;
@@ -28,6 +37,8 @@ export class ClaudeSubprocess extends EventEmitter {
                     stdio: ["pipe", "pipe", "pipe"],
                 });
 
+                _activeCount++;
+
                 this.timeoutId = setTimeout(() => {
                     if (!this.isKilled) {
                         this.isKilled = true;
@@ -38,6 +49,7 @@ export class ClaudeSubprocess extends EventEmitter {
 
                 this.process.on("error", (err) => {
                     this.clearTimeout();
+                    _activeCount = Math.max(0, _activeCount - 1);
                     if (err.message.includes("ENOENT")) {
                         reject(new Error("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"));
                     } else {
@@ -51,8 +63,7 @@ export class ClaudeSubprocess extends EventEmitter {
                 console.error(`[Subprocess] Spawned PID:${this.process.pid} session:${options.sessionId || "none"} model:${options.model}`);
 
                 this.process.stdout?.on("data", (chunk) => {
-                    const data = chunk.toString();
-                    this.buffer += data;
+                    this.buffer += chunk.toString();
                     this.processBuffer();
                 });
 
@@ -64,6 +75,7 @@ export class ClaudeSubprocess extends EventEmitter {
                 this.process.on("close", (code) => {
                     console.error(`[Subprocess] PID:${this.process?.pid} exited code:${code}`);
                     this.clearTimeout();
+                    _activeCount = Math.max(0, _activeCount - 1);
                     if (this.buffer.trim()) this.processBuffer();
                     this.emit("close", code);
                 });
@@ -71,6 +83,7 @@ export class ClaudeSubprocess extends EventEmitter {
                 resolve();
             } catch (err) {
                 this.clearTimeout();
+                _activeCount = Math.max(0, _activeCount - 1);
                 reject(err);
             }
         });
@@ -83,25 +96,27 @@ export class ClaudeSubprocess extends EventEmitter {
             "--verbose",
             "--include-partial-messages",
             "--model", options.model,
-            // Tools for agent capability
             "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch",
             "--dangerously-skip-permissions",
         ];
 
+        // Pass system prompt via dedicated flag (more reliable than XML in prompt)
+        if (options.systemPrompt) {
+            args.push("--system-prompt", options.systemPrompt);
+        }
+
+        // Session handling
         if (options.sessionId) {
             if (options.isNewSession) {
-                // First time: create new session with this ID
                 args.push("--session-id", options.sessionId);
             } else {
-                // Subsequent requests: resume existing session
                 args.push("--resume", options.sessionId);
             }
         } else {
-            // No session tracking - stateless mode
             args.push("--no-session-persistence");
         }
 
-        // No prompt in args - prompt is passed via stdin to avoid E2BIG
+        // No prompt in args — passed via stdin to avoid E2BIG
         return args;
     }
 

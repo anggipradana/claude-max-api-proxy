@@ -5,7 +5,7 @@
  */
 import express from "express";
 import { createServer } from "http";
-import { handleChatCompletions, handleModels, handleHealth, handleSessionsList, handleSessionReset, handleSessionsResetAll } from "./routes.js";
+import { handleChatCompletions, handleModels, handleHealth, handleStats, handleSessionsList, handleSessionReset, handleSessionsResetAll } from "./routes.js";
 let serverInstance = null;
 /**
  * Create and configure the Express app
@@ -34,6 +34,7 @@ function createApp() {
     });
     // Routes
     app.get("/health", handleHealth);
+    app.get("/stats", handleStats);
     app.get("/v1/models", handleModels);
     app.post("/v1/chat/completions", handleChatCompletions);
     // Session management
