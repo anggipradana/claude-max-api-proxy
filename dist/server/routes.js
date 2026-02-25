@@ -24,6 +24,14 @@ function isSessionNotFoundError(result) {
         result.errors.some(e => typeof e === "string" && e.includes("No conversation found"));
 }
 
+// ─── Timeout constants ────────────────────────────────────────────────────────
+const FIRST_TOKEN_TIMEOUT_MS = parseInt(process.env.FIRST_TOKEN_TIMEOUT_MS || "90000");  // 90s
+const INACTIVITY_TIMEOUT_MS  = parseInt(process.env.INACTIVITY_TIMEOUT_MS  || "60000");  // 60s
+const KEEPALIVE_INTERVAL_MS  = parseInt(process.env.KEEPALIVE_INTERVAL_MS  || "20000");  // 20s
+
+// ─── Per-session active request guard ─────────────────────────────────────────
+const activeSessionRequests = new Set();
+
 // ─── Concurrency Semaphore ────────────────────────────────────────────────────
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "4");
 
@@ -99,6 +107,39 @@ export async function handleChatCompletions(req, res) {
         // ── Session Management ──
         await sessionManager.load();
         const externalSessionId = deriveSessionId(req, body);
+
+        // ── Per-session duplicate request guard ──
+        if (activeSessionRequests.has(externalSessionId)) {
+            const waitMsg = "⏳ Masih memproses pesan sebelumnya, harap tunggu.";
+            if (stream) {
+                res.setHeader("Content-Type", "text/event-stream");
+                res.setHeader("Cache-Control", "no-cache");
+                res.setHeader("Connection", "keep-alive");
+                res.flushHeaders();
+                const chunk = {
+                    id: `chatcmpl-${uuidv4().replace(/-/g, "").slice(0, 24)}`,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: body.model || "claude-sonnet-4",
+                    choices: [{ index: 0, delta: { role: "assistant", content: waitMsg }, finish_reason: null }],
+                };
+                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                res.write("data: [DONE]\n\n");
+                res.end();
+            } else {
+                res.json({
+                    id: `chatcmpl-${uuidv4().replace(/-/g, "").slice(0, 24)}`,
+                    object: "chat.completion",
+                    created: Math.floor(Date.now() / 1000),
+                    model: body.model || "claude-sonnet-4",
+                    choices: [{ index: 0, message: { role: "assistant", content: waitMsg }, finish_reason: "stop" }],
+                    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                });
+            }
+            return;
+        }
+        activeSessionRequests.add(externalSessionId);
+
         const model = extractModel(body.model || "claude-sonnet-4");
         const { claudeSessionId, messageCount, isNew } = sessionManager.getOrCreate(externalSessionId, model);
 
@@ -145,18 +186,22 @@ export async function handleChatCompletions(req, res) {
             }
         };
 
-        let outcome = await runAttempt(cliInput);
+        try {
+            let outcome = await runAttempt(cliInput);
 
-        if (outcome?.sessionError) {
-            console.error(`[Routes] Session not found for ${externalSessionId.slice(0, 16)}... — resetting and retrying`);
-            sessionManager.reset(externalSessionId);
-            const { claudeSessionId: newSessionId } = sessionManager.getOrCreate(externalSessionId, model);
-            await runAttempt({
-                ...cliInput,
-                sessionId: newSessionId,
-                isNewSession: true,
-                prompt: messagesToPrompt(body.messages),
-            });
+            if (outcome?.sessionError) {
+                console.error(`[Routes] Session not found for ${externalSessionId.slice(0, 16)}... — resetting and retrying`);
+                sessionManager.reset(externalSessionId);
+                const { claudeSessionId: newSessionId } = sessionManager.getOrCreate(externalSessionId, model);
+                await runAttempt({
+                    ...cliInput,
+                    sessionId: newSessionId,
+                    isNewSession: true,
+                    prompt: messagesToPrompt(body.messages),
+                });
+            }
+        } finally {
+            activeSessionRequests.delete(externalSessionId);
         }
     } catch (error) {
         stats.errorRequests++;
@@ -183,15 +228,74 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
         let lastModel = cliInput.model;
         let isComplete = false;
         let finalResult = null;
+        let lastActivityAt = Date.now();
+
+        // ── safeResolve: ensures timers are cleared and resolve is called once ──
+        let resolved = false;
+        const timers = { keepAlive: null, firstToken: null, inactivity: null };
+        const safeResolve = (value) => {
+            if (resolved) return;
+            resolved = true;
+            clearInterval(timers.keepAlive);
+            clearTimeout(timers.firstToken);
+            clearInterval(timers.inactivity);
+            resolve(value);
+        };
+
+        // ── Helper: send a text chunk then close stream ──
+        const sendTimeoutMessage = (msg) => {
+            if (!res.writableEnded) {
+                const chunk = {
+                    id: `chatcmpl-${requestId}`,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: lastModel,
+                    choices: [{ index: 0, delta: { role: isFirst ? "assistant" : undefined, content: msg }, finish_reason: null }],
+                };
+                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                res.write("data: [DONE]\n\n");
+                res.end();
+            }
+        };
+
+        // ── Keepalive ping every 20s to prevent SSE connection drop ──
+        timers.keepAlive = setInterval(() => {
+            if (!res.writableEnded) res.write(": ping\n\n");
+        }, KEEPALIVE_INTERVAL_MS);
+
+        // ── First-token timeout: kill if no content after 90s ──
+        timers.firstToken = setTimeout(() => {
+            if (isFirst) {
+                console.error(`[Streaming] First-token timeout (${FIRST_TOKEN_TIMEOUT_MS}ms) for request ${requestId}`);
+                subprocess.kill();
+                sendTimeoutMessage("⏱️ Waktu tunggu habis. Coba kirim ulang pesan.");
+                safeResolve({ sessionError: false });
+            }
+        }, FIRST_TOKEN_TIMEOUT_MS);
+
+        // ── Inactivity check: kill if no delta for 60s after streaming started ──
+        timers.inactivity = setInterval(() => {
+            if (!isComplete && !isFirst && (Date.now() - lastActivityAt) > INACTIVITY_TIMEOUT_MS) {
+                console.error(`[Streaming] Inactivity timeout (${INACTIVITY_TIMEOUT_MS}ms) for request ${requestId}`);
+                subprocess.kill();
+                sendTimeoutMessage("⚠️ Tidak ada aktivitas. Coba lagi.");
+                safeResolve({ sessionError: false });
+            }
+        }, 10000);
 
         res.on("close", () => {
             if (!isComplete) subprocess.kill();
-            resolve({ sessionError: false });
+            safeResolve({ sessionError: false });
         });
 
         subprocess.on("content_delta", (event) => {
             const text = event.event.delta?.text || "";
             if (text && !res.writableEnded) {
+                if (isFirst) {
+                    // First token received — cancel first-token timeout
+                    clearTimeout(timers.firstToken);
+                    timers.firstToken = null;
+                }
                 const chunk = {
                     id: `chatcmpl-${requestId}`,
                     object: "chat.completion.chunk",
@@ -201,6 +305,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 };
                 res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                 isFirst = false;
+                lastActivityAt = Date.now();
             }
         });
 
@@ -212,7 +317,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
             // Auto-recovery: if session file deleted and no content sent yet, retry transparently
             if (isSessionNotFoundError(result) && isFirst) {
                 console.error("[Streaming] Session not found, will retry with new session");
-                resolve({ sessionError: true });
+                safeResolve({ sessionError: true });
                 return;
             }
             finalResult = result;
@@ -223,7 +328,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 res.write("data: [DONE]\n\n");
                 res.end();
             }
-            resolve({ sessionError: false });
+            safeResolve({ sessionError: false });
         });
 
         subprocess.on("error", (error) => {
@@ -233,7 +338,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 res.write(`data: ${JSON.stringify({ error: { message: error.message, type: "server_error", code: null } })}\n\n`);
                 res.end();
             }
-            resolve({ sessionError: false });
+            safeResolve({ sessionError: false });
         });
 
         subprocess.on("close", (code) => {
@@ -244,7 +349,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 res.write("data: [DONE]\n\n");
                 res.end();
             }
-            resolve({ sessionError: false });
+            safeResolve({ sessionError: false });
         });
 
         subprocess.start(cliInput.prompt, {
@@ -259,7 +364,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
                 res.write(`data: ${JSON.stringify({ error: { message: err.message, type: "server_error", code: null } })}\n\n`);
                 res.end();
             }
-            resolve({ sessionError: false });
+            safeResolve({ sessionError: false });
         });
     });
 }
@@ -270,6 +375,27 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
     return new Promise((resolve) => {
         let finalResult = null;
 
+        // ── safeResolve: ensures overallTimer is cleared and resolve is called once ──
+        let resolved = false;
+        const safeResolve = (value) => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(overallTimer);
+            resolve(value);
+        };
+
+        // ── Overall timeout (first-token + inactivity = 150s by default) ──
+        const overallTimer = setTimeout(() => {
+            console.error(`[NonStreaming] Overall timeout for request ${requestId}`);
+            subprocess.kill();
+            if (!res.headersSent) {
+                res.status(503).json({
+                    error: { message: "⏱️ Waktu tunggu habis. Coba kirim ulang.", type: "timeout_error", code: "timeout" },
+                });
+            }
+            safeResolve({ sessionError: false });
+        }, FIRST_TOKEN_TIMEOUT_MS + INACTIVITY_TIMEOUT_MS);
+
         subprocess.on("result", (result) => { finalResult = result; });
 
         subprocess.on("error", (error) => {
@@ -278,7 +404,7 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
             }
-            resolve({ sessionError: false });
+            safeResolve({ sessionError: false });
         });
 
         subprocess.on("close", (code) => {
@@ -286,7 +412,7 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
                 // Auto-recovery: session file deleted → retry transparently
                 if (isSessionNotFoundError(finalResult)) {
                     console.error("[NonStreaming] Session not found, will retry with new session");
-                    resolve({ sessionError: true });
+                    safeResolve({ sessionError: true });
                     return;
                 }
                 onSuccess(finalResult);
@@ -297,7 +423,7 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
                     error: { message: `Claude CLI exited with code ${code} without response`, type: "server_error", code: null },
                 });
             }
-            resolve({ sessionError: false });
+            safeResolve({ sessionError: false });
         });
 
         subprocess.start(cliInput.prompt, {
@@ -310,7 +436,7 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
             }
-            resolve({ sessionError: false });
+            safeResolve({ sessionError: false });
         });
     });
 }
@@ -338,6 +464,7 @@ export function handleHealth(_req, res) {
         status: "ok",
         provider: "claude-code-cli",
         sessions: sessionManager.size,
+        activeSessions: activeSessionRequests.size,
         activeSubprocesses: getActiveSubprocessCount(),
         concurrencyLimit: MAX_CONCURRENT,
         queuedRequests: semaphore.queue.length,
