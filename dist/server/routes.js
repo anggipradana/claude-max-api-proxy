@@ -26,7 +26,7 @@ function isSessionNotFoundError(result) {
 
 // ─── Timeout constants ────────────────────────────────────────────────────────
 const FIRST_TOKEN_TIMEOUT_MS = parseInt(process.env.FIRST_TOKEN_TIMEOUT_MS || "90000");  // 90s
-const INACTIVITY_TIMEOUT_MS  = parseInt(process.env.INACTIVITY_TIMEOUT_MS  || "60000");  // 60s
+const INACTIVITY_TIMEOUT_MS  = parseInt(process.env.INACTIVITY_TIMEOUT_MS  || "120000"); // 120s
 const KEEPALIVE_INTERVAL_MS  = parseInt(process.env.KEEPALIVE_INTERVAL_MS  || "20000");  // 20s
 
 // ─── Per-session active request guard ─────────────────────────────────────────
@@ -171,15 +171,28 @@ export async function handleChatCompletions(req, res) {
             }
         };
 
+        // ── onTimeout: update session state on timeout to prevent message explosion ──
+        // resetSession=true  → first-token timeout: Claude may not have the message → full reset
+        // resetSession=false → inactivity timeout: Claude had the message, just update count
+        const onTimeout = (resetSession = false) => {
+            stats.errorRequests++;
+            if (resetSession) {
+                sessionManager.reset(externalSessionId);
+                console.error(`[Routes] Session ${externalSessionId.slice(0, 16)}... reset after first-token timeout`);
+            } else {
+                sessionManager.updateMessageCount(externalSessionId, totalMessages);
+            }
+        };
+
         // ── Run with auto-retry on session-not-found ──
         const runAttempt = async (input) => {
             await semaphore.acquire();
             const subprocess = new ClaudeSubprocess();
             try {
                 if (stream) {
-                    return await handleStreamingResponse(req, res, subprocess, input, requestId, onSuccess);
+                    return await handleStreamingResponse(req, res, subprocess, input, requestId, onSuccess, onTimeout);
                 } else {
-                    return await handleNonStreamingResponse(res, subprocess, input, requestId, onSuccess);
+                    return await handleNonStreamingResponse(res, subprocess, input, requestId, onSuccess, onTimeout);
                 }
             } finally {
                 semaphore.release();
@@ -215,7 +228,7 @@ export async function handleChatCompletions(req, res) {
 
 // ─── Streaming response ───────────────────────────────────────────────────────
 
-async function handleStreamingResponse(req, res, subprocess, cliInput, requestId, onSuccess) {
+async function handleStreamingResponse(req, res, subprocess, cliInput, requestId, onSuccess, onTimeout) {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -267,16 +280,18 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
         timers.firstToken = setTimeout(() => {
             if (isFirst) {
                 console.error(`[Streaming] First-token timeout (${FIRST_TOKEN_TIMEOUT_MS}ms) for request ${requestId}`);
+                onTimeout(true); // reset session — Claude may not have received the message
                 subprocess.kill();
                 sendTimeoutMessage("⏱️ Waktu tunggu habis. Coba kirim ulang pesan.");
                 safeResolve({ sessionError: false });
             }
         }, FIRST_TOKEN_TIMEOUT_MS);
 
-        // ── Inactivity check: kill if no delta for 60s after streaming started ──
+        // ── Inactivity check: kill if no delta for 120s after streaming started ──
         timers.inactivity = setInterval(() => {
             if (!isComplete && !isFirst && (Date.now() - lastActivityAt) > INACTIVITY_TIMEOUT_MS) {
                 console.error(`[Streaming] Inactivity timeout (${INACTIVITY_TIMEOUT_MS}ms) for request ${requestId}`);
+                onTimeout(false); // update count — Claude had the message, just went quiet
                 subprocess.kill();
                 sendTimeoutMessage("⚠️ Tidak ada aktivitas. Coba lagi.");
                 safeResolve({ sessionError: false });
@@ -371,7 +386,7 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
 
 // ─── Non-streaming response ───────────────────────────────────────────────────
 
-async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, onSuccess) {
+async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, onSuccess, onTimeout) {
     return new Promise((resolve) => {
         let finalResult = null;
 
@@ -384,9 +399,10 @@ async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, 
             resolve(value);
         };
 
-        // ── Overall timeout (first-token + inactivity = 150s by default) ──
+        // ── Overall timeout (first-token + inactivity = 210s by default) ──
         const overallTimer = setTimeout(() => {
             console.error(`[NonStreaming] Overall timeout for request ${requestId}`);
+            onTimeout(true); // reset session — unknown state after timeout
             subprocess.kill();
             if (!res.headersSent) {
                 res.status(503).json({
