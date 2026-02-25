@@ -48,6 +48,15 @@ class SessionManager {
         if (existing) {
             existing.lastUsedAt = Date.now();
             existing.model = model;
+            // Recover from corrupted state (empty claudeSessionId).
+            // Without a valid UUID, subprocess falls back to --no-session-persistence
+            // and Claude has no history on every request.
+            if (!existing.claudeSessionId) {
+                existing.claudeSessionId = uuidv4();
+                existing.messageCount = 0; // force INIT so session file is created with full history
+                console.error(`[SessionManager] Recovered empty session ID for ${externalId.slice(0, 20)}... → ${existing.claudeSessionId}`);
+                this.save();
+            }
             return { claudeSessionId: existing.claudeSessionId, messageCount: existing.messageCount, isNew: false };
         }
         const claudeSessionId = uuidv4();
