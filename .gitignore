@@ -1,0 +1,5 @@
+node_modules/
+*.log
+.env
+dist/**/*.map
+~/.claude-max-proxy-sessions.json

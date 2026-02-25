@@ -1,0 +1,30 @@
+{
+  "name": "claude-max-api-proxy",
+  "version": "2.0.0",
+  "description": "OpenAI-compatible API server wrapping Claude Code CLI. Supports incremental sessions, tool use (Bash/Read/Write/etc), and large context via stdin.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "claude-max-api": "dist/server/standalone.js"
+  },
+  "scripts": {
+    "start": "node dist/server/standalone.js",
+    "dev": "NODE_ENV=development node dist/server/standalone.js"
+  },
+  "keywords": [
+    "claude", "anthropic", "claude-code", "claude-max",
+    "openai-compatible", "api-proxy", "llm", "ai"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anggipradana/claude-max-api-proxy"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "uuid": "^11.0.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
