@@ -1,8 +1,7 @@
 #!/bin/bash
-# Start claude-proxy + openclaw gateway
-# Run as anggi user (uses sudo for openclaw)
+# Start claude-proxy + claude-code-telegram bot
 
-echo "[0/3] Ensuring Telegram IPv4 in /etc/hosts..."
+echo "[0/2] Ensuring Telegram IPv4 in /etc/hosts..."
 if ! grep -q "api.telegram.org" /etc/hosts 2>/dev/null; then
     echo '@anggi1' | sudo -S bash -c 'echo "149.154.166.110 api.telegram.org" >> /etc/hosts' 2>/dev/null
     echo "  Added api.telegram.org → 149.154.166.110"
@@ -10,18 +9,13 @@ else
     echo "  api.telegram.org already in /etc/hosts"
 fi
 
-echo "[1/3] Killing old processes..."
+echo "[1/2] Killing old processes..."
 
 # Kill anything on port 3456 (proxy)
 fuser -k 3456/tcp 2>/dev/null && echo "  Killed process on port 3456"
 
-# Kill old openclaw gateway
-for pid in $(pgrep -f "openclaw-gateway" 2>/dev/null); do
-    echo '@anggi1' | sudo -S kill "$pid" 2>/dev/null && echo "  Killed openclaw PID $pid"
-done
-
-# Delete stale lock files
-echo '@anggi1' | sudo -S rm -f /tmp/openclaw-0/gateway.*.lock 2>/dev/null
+# Kill old telegram bot
+pkill -f "claude-telegram-bot" 2>/dev/null && echo "  Killed old claude-telegram-bot"
 
 # Wait for port 3456 to be fully free
 for i in $(seq 1 10); do
@@ -29,7 +23,7 @@ for i in $(seq 1 10); do
     sleep 1
 done
 
-echo "[2/3] Starting claude-max-api proxy (with auto-restart)..."
+echo "[2/2] Starting claude-max-api proxy (with auto-restart)..."
 
 # Run proxy in tmux window 'proxy' with restart loop
 tmux kill-window -t claude-fixed:proxy 2>/dev/null
@@ -48,29 +42,23 @@ else
     echo "  Proxy: FAILED (check /tmp/proxy-new.log)"
 fi
 
-echo "[3/3] Starting openclaw gateway..."
-python3 -c "
-import subprocess, time
+echo "[3/3] Starting claude-code-telegram bot (with auto-restart)..."
 
-proc = subprocess.Popen(
-    ['sudo', '-S', '-u', 'root', 'sh', '-c',
-     'HOME=/root USER=root NODE_OPTIONS=\'--no-network-family-autoselection --dns-result-order=ipv4first\' exec openclaw gateway run'],
-    stdin=subprocess.PIPE,
-    stdout=open('/tmp/openclaw-new-run.log', 'w'),
-    stderr=subprocess.STDOUT,
-    start_new_session=True
-)
-proc.stdin.write(b'@anggi1\n')
-proc.stdin.flush()
-proc.stdin.close()
-print(f'  openclaw PID: {proc.pid}')
-"
+# Run bot in tmux window 'telegram' with restart loop
+tmux kill-window -t claude-fixed:telegram 2>/dev/null
+tmux new-window -t claude-fixed -n telegram
+tmux send-keys -t claude-fixed:telegram "cd /home/anggi/claude-telegram-bot && while true; do
+    env -u CLAUDECODE -u CLAUDE_CODE /home/anggi/.local/bin/claude-telegram-bot --config-file .env 2>&1 | tee /tmp/claude-telegram-bot.log
+    echo '[telegram-bot] Crashed or exited. Restarting in 5s...'
+    sleep 5
+done" Enter 2>/dev/null
 
-sleep 8
-if ss -tlnp 2>/dev/null | grep -q 18789; then
-    echo "  OpenClaw: OK (port 18789)"
+sleep 5
+
+if grep -q "Application started" /tmp/claude-telegram-bot.log 2>/dev/null; then
+    echo "  Telegram bot: OK (@xcbrduckxbot)"
 else
-    echo "  OpenClaw: FAILED (check /tmp/openclaw-new-run.log)"
+    echo "  Telegram bot: FAILED (check /tmp/claude-telegram-bot.log)"
 fi
 
 echo ""
